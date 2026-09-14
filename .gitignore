@@ -1,0 +1,16 @@
+# Build artifacts
+/bin/
+/dist/
+/api
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local environment overrides (API_PORT etc.)
+.env
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
