@@ -190,3 +190,36 @@ func TestCheckedPairsCount(t *testing.T) {
 		}
 	}
 }
+
+// TestDiffConflicts checks that a conflict is identified by pair and rule —
+// a changed reason alone counts as neither resolved nor introduced — and
+// that both result lists are ordered by pair.
+func TestDiffConflicts(t *testing.T) {
+	before := []Conflict{
+		{Pair: [2]string{"A", "B"}, Rule: RuleClass1Isolation, Reason: "original wording"},
+		{Pair: [2]string{"A", "C"}, Rule: RuleOxidizerBaySep, Reason: "r2"},
+		{Pair: [2]string{"B", "D"}, Rule: RuleCorrosiveFlamGas, Reason: "r3"},
+	}
+	after := []Conflict{
+		{Pair: [2]string{"A", "B"}, Rule: RuleClass1Isolation, Reason: "moved, but same pair and rule"},
+		{Pair: [2]string{"B", "C"}, Rule: RuleOxidizerBaySep, Reason: "r4"},
+		{Pair: [2]string{"C", "D"}, Rule: RuleCorrosiveFlamGas, Reason: "r5"},
+	}
+	resolved, introduced := DiffConflicts(before, after)
+
+	if len(resolved) != 2 || resolved[0].Pair != [2]string{"A", "C"} || resolved[1].Pair != [2]string{"B", "D"} {
+		t.Fatalf("resolved = %+v, want pairs [A C] and [B D]", resolved)
+	}
+	if len(introduced) != 2 || introduced[0].Pair != [2]string{"B", "C"} || introduced[1].Pair != [2]string{"C", "D"} {
+		t.Fatalf("introduced = %+v, want pairs [B C] and [C D]", introduced)
+	}
+
+	// Empty adjudications diff to empty (non-nil) lists.
+	resolved, introduced = DiffConflicts(nil, nil)
+	if len(resolved) != 0 || len(introduced) != 0 {
+		t.Fatalf("empty diff = %+v / %+v, want both empty", resolved, introduced)
+	}
+	if resolved == nil || introduced == nil {
+		t.Fatal("empty diff must stay non-nil so it marshals as []")
+	}
+}

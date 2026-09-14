@@ -64,6 +64,63 @@ func Adjudicate(items []Item) (checkedPairs int, conflicts []Conflict) {
 	return checkedPairs, conflicts
 }
 
+// DiffConflicts compares the conflicts of two adjudications of the same
+// manifest — typically before and after moving one container — and returns
+// the conflicts the change resolved (present in before, absent in after) and
+// those it introduced (absent in before, present in after). A conflict is
+// identified by its pair and rule: a pair that still violates the same rule
+// after the change is neither resolved nor introduced, even if the positions
+// in its reason moved. Both lists are ordered by pair and then rule, so the
+// result is deterministic.
+func DiffConflicts(before, after []Conflict) (resolved, introduced []Conflict) {
+	resolved = []Conflict{}
+	introduced = []Conflict{}
+
+	inBefore := make(map[conflictKey]bool, len(before))
+	for _, c := range before {
+		inBefore[keyOf(c)] = true
+	}
+	inAfter := make(map[conflictKey]bool, len(after))
+	for _, c := range after {
+		inAfter[keyOf(c)] = true
+	}
+	for _, c := range before {
+		if !inAfter[keyOf(c)] {
+			resolved = append(resolved, c)
+		}
+	}
+	for _, c := range after {
+		if !inBefore[keyOf(c)] {
+			introduced = append(introduced, c)
+		}
+	}
+	sort.Slice(resolved, func(i, j int) bool { return lessConflict(resolved[i], resolved[j]) })
+	sort.Slice(introduced, func(i, j int) bool { return lessConflict(introduced[i], introduced[j]) })
+	return resolved, introduced
+}
+
+// conflictKey identifies a conflict by the pair of cargo IDs and the rule
+// that rejected it, independent of the positions stated in the reason.
+type conflictKey struct {
+	pair [2]string
+	rule string
+}
+
+func keyOf(c Conflict) conflictKey {
+	return conflictKey{pair: c.Pair, rule: c.Rule}
+}
+
+// lessConflict orders conflicts by pair and then by rule.
+func lessConflict(a, b Conflict) bool {
+	if a.Pair[0] != b.Pair[0] {
+		return a.Pair[0] < b.Pair[0]
+	}
+	if a.Pair[1] != b.Pair[1] {
+		return a.Pair[1] < b.Pair[1]
+	}
+	return a.Rule < b.Rule
+}
+
 // pairConflict applies the segregation rules to one unordered pair, in rule
 // order, and reports the first matching rule.
 func pairConflict(a, b Item) (Conflict, bool) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,14 @@ type adjudication struct {
 	Conflicts    []conflict `json:"conflicts"`
 }
 
+// previewResponse mirrors the relocation-preview 200 response body.
+type previewResponse struct {
+	Before              adjudication `json:"before"`
+	After               adjudication `json:"after"`
+	ResolvedConflicts   []conflict   `json:"resolved_conflicts"`
+	IntroducedConflicts []conflict   `json:"introduced_conflicts"`
+}
+
 // validationFailure mirrors the 400 response body.
 type validationFailure struct {
 	Error   string `json:"error"`
@@ -73,12 +82,18 @@ type validationFailure struct {
 	} `json:"details"`
 }
 
-// postManifest POSTs a raw JSON body to the validation endpoint.
-func postManifest(t *testing.T, base, body string) (int, []byte) {
+// Endpoint paths shared by the test helpers.
+const (
+	validatePath = "/api/v1/pre-stowage/validate"
+	previewPath  = "/api/v1/pre-stowage/relocation-preview"
+)
+
+// postJSON POSTs a raw JSON body to one endpoint of the API.
+func postJSON(t *testing.T, base, path, body string) (int, []byte) {
 	t.Helper()
-	resp, err := http.Post(base+"/api/v1/pre-stowage/validate", "application/json", strings.NewReader(body))
+	resp, err := http.Post(base+path, "application/json", strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("POST failed: %v", err)
+		t.Fatalf("POST %s failed: %v", path, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -86,6 +101,16 @@ func postManifest(t *testing.T, base, body string) (int, []byte) {
 		t.Fatalf("reading response: %v", err)
 	}
 	return resp.StatusCode, data
+}
+
+// postManifest POSTs a raw JSON body to the validation endpoint.
+func postManifest(t *testing.T, base, body string) (int, []byte) {
+	return postJSON(t, base, validatePath, body)
+}
+
+// postPreview POSTs a raw JSON body to the relocation-preview endpoint.
+func postPreview(t *testing.T, base, body string) (int, []byte) {
+	return postJSON(t, base, previewPath, body)
 }
 
 // adjudicate posts a manifest and decodes the expected 200 response.
@@ -96,6 +121,20 @@ func adjudicate(t *testing.T, base, body string) adjudication {
 		t.Fatalf("status = %d, want 200; body: %s", status, data)
 	}
 	var out adjudication
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decoding response: %v; body: %s", err, data)
+	}
+	return out
+}
+
+// preview posts a relocation-preview request and decodes the 200 response.
+func preview(t *testing.T, base, body string) previewResponse {
+	t.Helper()
+	status, data := postPreview(t, base, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", status, data)
+	}
+	var out previewResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("decoding response: %v; body: %s", err, data)
 	}
@@ -116,10 +155,10 @@ func reject(t *testing.T, base, body string) validationFailure {
 	return out
 }
 
-// manifest builds a request body from "cargo_id,class,bay,deck" tuples.
-func manifest(items ...[4]string) string {
+// itemsJSON renders the items array shared by both request builders from
+// "cargo_id,class,bay,deck" tuples.
+func itemsJSON(items ...[4]string) string {
 	var sb strings.Builder
-	sb.WriteString(`{"items":[`)
 	for i, it := range items {
 		if i > 0 {
 			sb.WriteByte(',')
@@ -127,8 +166,20 @@ func manifest(items ...[4]string) string {
 		fmt.Fprintf(&sb, `{"cargo_id":%q,"hazard_class":%q,"bay":%s,"deck":%q}`,
 			it[0], it[1], it[2], it[3])
 	}
-	sb.WriteString(`]}`)
 	return sb.String()
+}
+
+// manifest builds a validate request body from "cargo_id,class,bay,deck"
+// tuples.
+func manifest(items ...[4]string) string {
+	return `{"items":[` + itemsJSON(items...) + `]}`
+}
+
+// previewBody builds a relocation-preview request body from the manifest
+// tuples, the target cargo ID and the candidate bay/deck.
+func previewBody(items [][4]string, target string, bay int, deck string) string {
+	return fmt.Sprintf(`{"items":[%s],"target_cargo_id":%q,"candidate":{"bay":%d,"deck":%q}}`,
+		itemsJSON(items...), target, bay, deck)
 }
 
 // fields collects the field paths of a validation failure.
@@ -517,5 +568,199 @@ func TestCheckedPairsCount(t *testing.T) {
 	}
 	if !out.Release {
 		t.Fatalf("release = false, want true; conflicts: %+v", out.Conflicts)
+	}
+}
+
+// TestRelocationPreviewResolvesConflict moves a container off the upper deck
+// and expects the only conflict of the manifest to disappear. The preview's
+// "before" half must equal the validate verdict for the same manifest.
+func TestRelocationPreviewResolvesConflict(t *testing.T) {
+	base := baseURL(t)
+	items := [][4]string{
+		{"ACID", "8", "5", "U"},
+		{"GAS", "2.1", "7", "U"}, // same deck as ACID -> conflict
+		{"NEUT", "3", "20", "L"},
+	}
+	out := preview(t, base, previewBody(items, "GAS", 7, "L"))
+
+	// The "before" half must equal the validate response for the same list.
+	want := adjudicate(t, base, manifest(items...))
+	if !reflect.DeepEqual(out.Before, want) {
+		t.Fatalf("before = %+v, want the validate response %+v", out.Before, want)
+	}
+	if out.Before.Release {
+		t.Fatal("before.release = true, want false")
+	}
+	if !out.After.Release {
+		t.Fatalf("after.release = false, want true; conflicts: %+v", out.After.Conflicts)
+	}
+	if out.After.CheckedPairs != 3 {
+		t.Fatalf("after.checked_pairs = %d, want 3", out.After.CheckedPairs)
+	}
+	if len(out.ResolvedConflicts) != 1 || out.ResolvedConflicts[0].Pair != [2]string{"ACID", "GAS"} {
+		t.Fatalf("resolved_conflicts = %+v, want exactly the ACID/GAS pair", out.ResolvedConflicts)
+	}
+	if got := out.ResolvedConflicts[0].Rule; got != "CORROSIVE_FLAMMABLE_GAS_SEPARATION" {
+		t.Fatalf("rule = %q, want CORROSIVE_FLAMMABLE_GAS_SEPARATION", got)
+	}
+	if len(out.IntroducedConflicts) != 0 {
+		t.Fatalf("introduced_conflicts = %+v, want empty", out.IntroducedConflicts)
+	}
+}
+
+// TestRelocationPreviewIntroducesConflict moves a class 3 container next to a
+// 5.1 oxidizer and expects exactly one new conflict, described at the
+// candidate position. The "after" half must equal the validate verdict for
+// the moved manifest.
+func TestRelocationPreviewIntroducesConflict(t *testing.T) {
+	base := baseURL(t)
+	items := [][4]string{
+		{"OXI", "5.1", "10", "U"},
+		{"FLAM", "3", "20", "L"},
+	}
+	out := preview(t, base, previewBody(items, "FLAM", 11, "L"))
+
+	if !out.Before.Release {
+		t.Fatalf("before.release = false, want true; conflicts: %+v", out.Before.Conflicts)
+	}
+	if out.After.Release {
+		t.Fatal("after.release = true, want false")
+	}
+	// The "after" half must equal the validate response of the moved list.
+	moved := adjudicate(t, base, manifest(
+		[4]string{"OXI", "5.1", "10", "U"},
+		[4]string{"FLAM", "3", "11", "L"},
+	))
+	if !reflect.DeepEqual(out.After, moved) {
+		t.Fatalf("after = %+v, want the validate response %+v", out.After, moved)
+	}
+	if len(out.ResolvedConflicts) != 0 {
+		t.Fatalf("resolved_conflicts = %+v, want empty", out.ResolvedConflicts)
+	}
+	if len(out.IntroducedConflicts) != 1 {
+		t.Fatalf("introduced_conflicts = %+v, want exactly 1", out.IntroducedConflicts)
+	}
+	c := out.IntroducedConflicts[0]
+	if c.Pair != [2]string{"FLAM", "OXI"} {
+		t.Fatalf("pair = %v, want [FLAM OXI]", c.Pair)
+	}
+	if c.Rule != "OXIDIZER_BAY_SEPARATION" {
+		t.Fatalf("rule = %q, want OXIDIZER_BAY_SEPARATION", c.Rule)
+	}
+	if !strings.Contains(c.Reason, "FLAM bay 11") {
+		t.Fatalf("reason = %q, want it to reference the candidate bay 11", c.Reason)
+	}
+}
+
+// TestRelocationPreviewRejectedWholesale feeds the preview endpoint an
+// unknown target, illegal candidate positions and an invalid manifest: every
+// case must fail with HTTP 400, an accurate field path and no partial
+// adjudication in the body.
+func TestRelocationPreviewRejectedWholesale(t *testing.T) {
+	base := baseURL(t)
+	good := [][4]string{
+		{"ACID", "8", "5", "U"},
+		{"GAS", "2.1", "7", "U"},
+	}
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"unknown_target", previewBody(good, "GHOST", 7, "L"), "target_cargo_id"},
+		{"missing_target", `{"items":[` + itemsJSON(good...) + `],"candidate":{"bay":7,"deck":"L"}}`, "target_cargo_id"},
+		{"candidate_bay_out_of_range", previewBody(good, "GAS", 31, "L"), "candidate.bay"},
+		{"candidate_bay_fractional", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS","candidate":{"bay":7.5,"deck":"L"}}`, "candidate.bay"},
+		{"candidate_deck_invalid", previewBody(good, "GAS", 7, "X"), "candidate.deck"},
+		{"candidate_missing", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS"}`, "candidate"},
+		{"candidate_not_object", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS","candidate":"bay 7"}`, "candidate"},
+		{"manifest_item_invalid", `{"items":[{"cargo_id":"ACID","hazard_class":"8","bay":5,"deck":"U"},` +
+			`{"cargo_id":"GAS","hazard_class":"2.1","bay":0,"deck":"U"}],` +
+			`"target_cargo_id":"GAS","candidate":{"bay":7,"deck":"L"}}`, "items[1].bay"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, data := postPreview(t, base, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", status, data)
+			}
+			var v validationFailure
+			if err := json.Unmarshal(data, &v); err != nil {
+				t.Fatalf("response is not JSON: %s", data)
+			}
+			if v.Error != "validation_failed" {
+				t.Fatalf("error = %q, want validation_failed", v.Error)
+			}
+			if !contains(fields(v), tc.field) {
+				t.Fatalf("details = %+v, want field %s", v.Details, tc.field)
+			}
+			// A rejected request must not carry any adjudication halves.
+			for _, key := range []string{`"before"`, `"after"`, `"resolved_conflicts"`, `"introduced_conflicts"`} {
+				if strings.Contains(string(data), key) {
+					t.Fatalf("400 body must not contain %s: %s", key, data)
+				}
+			}
+		})
+	}
+}
+
+// TestRelocationPreviewMalformedJSON posts a truncated body to the preview
+// endpoint and expects the same invalid_json shape as the validate endpoint.
+func TestRelocationPreviewMalformedJSON(t *testing.T) {
+	base := baseURL(t)
+	status, data := postPreview(t, base, `{"items":`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	var v validationFailure
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatalf("response is not JSON: %s", data)
+	}
+	if v.Error != "invalid_json" {
+		t.Fatalf("error = %q, want invalid_json", v.Error)
+	}
+}
+
+// TestRelocationPreviewOrderIndependent submits the same manifest and move in
+// two different item orders and requires byte-identical preview responses.
+func TestRelocationPreviewOrderIndependent(t *testing.T) {
+	base := baseURL(t)
+	forward := [][4]string{
+		{"DELTA", "1", "4", "U"},
+		{"ALPHA", "5.1", "10", "U"},
+		{"CHARLIE", "3", "11", "L"},
+		{"BRAVO", "8", "20", "U"},
+		{"ECHO", "2.1", "22", "U"},
+	}
+	reversed := [][4]string{
+		{"ECHO", "2.1", "22", "U"},
+		{"BRAVO", "8", "20", "U"},
+		{"CHARLIE", "3", "11", "L"},
+		{"ALPHA", "5.1", "10", "U"},
+		{"DELTA", "1", "4", "U"},
+	}
+	status1, body1 := postPreview(t, base, previewBody(forward, "ECHO", 30, "L"))
+	status2, body2 := postPreview(t, base, previewBody(reversed, "ECHO", 30, "L"))
+	if status1 != http.StatusOK || status2 != http.StatusOK {
+		t.Fatalf("statuses = %d, %d; want 200, 200", status1, status2)
+	}
+	if string(body1) != string(body2) {
+		t.Fatalf("item order changed the preview:\n%s\nvs\n%s", body1, body2)
+	}
+
+	var out previewResponse
+	if err := json.Unmarshal(body1, &out); err != nil {
+		t.Fatal(err)
+	}
+	// Moving ECHO to a distant lower-deck bay only lifts the BRAVO/ECHO
+	// conflict; the class-1 conflicts of DELTA remain.
+	if len(out.ResolvedConflicts) != 1 || out.ResolvedConflicts[0].Pair != [2]string{"BRAVO", "ECHO"} {
+		t.Fatalf("resolved_conflicts = %+v, want only [BRAVO ECHO]", out.ResolvedConflicts)
+	}
+	if len(out.IntroducedConflicts) != 0 {
+		t.Fatalf("introduced_conflicts = %+v, want empty", out.IntroducedConflicts)
+	}
+	if out.After.Release {
+		t.Fatal("after.release = true, want false (DELTA conflicts remain)")
 	}
 }

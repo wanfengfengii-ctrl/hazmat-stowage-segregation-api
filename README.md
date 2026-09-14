@@ -155,6 +155,47 @@ curl -s -X POST http://localhost:8080/api/v1/pre-stowage/validate \
 
 请求体不是合法 JSON 时返回 `{"error":"invalid_json", ...}`，字段路径为 `(body)`。
 
+### `POST /api/v1/pre-stowage/relocation-preview`
+
+整票裁决被拦截后，预演“只移动某一个危险品箱”能否消除冲突。请求体在 `items`
+（校验规则与 validate 完全一致）之外增加两个字段：
+
+| 字段 | 要求 |
+|---|---|
+| `target_cargo_id` | 待移动箱子的 `cargo_id`，必须存在于清单中 |
+| `candidate` | 候选位置对象，仅含 `bay`（1–30 整数）与 `deck`（`"U"`/`"L"`），校验规则与清单项一致 |
+
+服务先裁决原清单（`before`），再把目标箱替换到候选位置复算（`after`），两份裁决
+与 validate 响应同格式；`resolved_conflicts` 与 `introduced_conflicts` 分别给出本次
+移位消除与引入的冲突。冲突按（箱对， 规则）识别——同一箱对移动后仍违反同一规则时，
+既不算消除也不算引入；两个列表均按箱对、再按规则码排序，结果确定。
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/pre-stowage/relocation-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"cargo_id":"ACID","hazard_class":"8","bay":5,"deck":"U"},
+        {"cargo_id":"GAS","hazard_class":"2.1","bay":7,"deck":"U"},
+        {"cargo_id":"NEUT","hazard_class":"3","bay":20,"deck":"L"}],
+       "target_cargo_id":"GAS",
+       "candidate":{"bay":7,"deck":"L"}}'
+```
+
+```json
+{
+  "before": {"release":false,"checked_pairs":3,"conflicts":[
+    {"pair":["ACID","GAS"],"rule":"CORROSIVE_FLAMMABLE_GAS_SEPARATION","reason":"hazard class 8 and class 2.1 require different decks and bay separation >= 1 (ACID deck U bay 5, GAS deck U bay 7)"}]},
+  "after": {"release":true,"checked_pairs":3,"conflicts":[]},
+  "resolved_conflicts": [
+    {"pair":["ACID","GAS"],"rule":"CORROSIVE_FLAMMABLE_GAS_SEPARATION","reason":"hazard class 8 and class 2.1 require different decks and bay separation >= 1 (ACID deck U bay 5, GAS deck U bay 7)"}],
+  "introduced_conflicts": []
+}
+```
+
+目标箱不存在（`target_cargo_id`）、候选位置非法（`candidate.bay`/`candidate.deck`）
+或清单本身非法（`items[i].*`）时，与 validate 一样整份拒绝：HTTP 400、准确的字段
+路径、一次返回全部错误，且响应中不含任何部分裁决结果。
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status":"ok"}`（Compose 健康检查与 verify 等待均使用它）。
@@ -180,6 +221,8 @@ docker-compose.yml           仅常驻 API；verify 为一次性验收服务（p
 ## 测试
 
 - `internal/stowage`：6×6 类别组合矩阵、bay 差边界（0/1/2）、deck×bay 四象限、
-  1 类对所有类别、排序确定性与箱对数公式。
+  1 类对所有类别、排序确定性与箱对数公式、移位前后冲突差集（resolved/introduced）。
 - `internal/httpapi`：标准库 `net/http` 直接请求接口——放行/拦截、边界箱位、
-  输入换序响应逐字节一致、整份拒绝、字段路径、重复箱号、非法 JSON 等。
+  输入换序响应逐字节一致、整份拒绝、字段路径、重复箱号、非法 JSON 等；
+  移位预演覆盖消除冲突、引入冲突、无效目标/位置整份拒绝、清单换序结果不变，
+  并交叉核对预演的 before/after 与 validate 裁决一致。

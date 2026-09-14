@@ -27,6 +27,7 @@ func NewRouter() *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.POST("/api/v1/pre-stowage/validate", validateManifest)
+	r.POST("/api/v1/pre-stowage/relocation-preview", relocationPreview)
 	return r
 }
 
@@ -43,52 +44,232 @@ type validateResponse struct {
 	Conflicts    []stowage.Conflict `json:"conflicts"`
 }
 
+// relocationPreviewResponse is the result of rehearsing the move of one
+// container: the adjudication of the manifest as submitted (before) and with
+// the target container placed at the candidate position (after), plus the
+// conflicts the move would resolve and introduce.
+type relocationPreviewResponse struct {
+	Before              validateResponse   `json:"before"`
+	After               validateResponse   `json:"after"`
+	ResolvedConflicts   []stowage.Conflict `json:"resolved_conflicts"`
+	IntroducedConflicts []stowage.Conflict `json:"introduced_conflicts"`
+}
+
 // validateManifest handles POST /api/v1/pre-stowage/validate. Any invalid
 // item rejects the whole manifest with HTTP 400; a well-formed manifest is
 // adjudicated and answered with HTTP 200 whether it is released or blocked.
 func validateManifest(c *gin.Context) {
 	items, ferrs := parseManifest(c.Request.Body)
 	if len(ferrs) > 0 {
-		code := "validation_failed"
-		if len(ferrs) == 1 && ferrs[0].Field == "(body)" {
-			code = "invalid_json"
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": code, "details": ferrs})
+		rejectValidation(c, ferrs)
 		return
 	}
+	c.JSON(http.StatusOK, adjudicateManifest(items))
+}
+
+// relocationPreview handles POST /api/v1/pre-stowage/relocation-preview. The
+// manifest, the target cargo ID and the candidate position are all validated
+// up front — any error rejects the whole request with HTTP 400 and no
+// partial result. Otherwise the manifest is adjudicated as submitted and
+// once more with the target container moved to the candidate position.
+func relocationPreview(c *gin.Context) {
+	items, target, cand, ferrs := parseRelocationPreview(c.Request.Body)
+	if len(ferrs) > 0 {
+		rejectValidation(c, ferrs)
+		return
+	}
+
+	before := adjudicateManifest(items)
+	moved := make([]stowage.Item, len(items))
+	copy(moved, items)
+	for i := range moved {
+		if moved[i].CargoID == target {
+			moved[i].Bay = cand.Bay
+			moved[i].Deck = cand.Deck
+		}
+	}
+	after := adjudicateManifest(moved)
+	resolved, introduced := stowage.DiffConflicts(before.Conflicts, after.Conflicts)
+
+	c.JSON(http.StatusOK, relocationPreviewResponse{
+		Before:              before,
+		After:               after,
+		ResolvedConflicts:   resolved,
+		IntroducedConflicts: introduced,
+	})
+}
+
+// adjudicateManifest runs the segregation rules over a well-formed manifest
+// and shapes the response body shared by both endpoints.
+func adjudicateManifest(items []stowage.Item) validateResponse {
 	checked, conflicts := stowage.Adjudicate(items)
-	c.JSON(http.StatusOK, validateResponse{
+	return validateResponse{
 		Release:      len(conflicts) == 0,
 		CheckedPairs: checked,
 		Conflicts:    conflicts,
-	})
+	}
+}
+
+// rejectValidation answers HTTP 400 with every field error found.
+func rejectValidation(c *gin.Context, ferrs []fieldError) {
+	code := "validation_failed"
+	if len(ferrs) == 1 && ferrs[0].Field == "(body)" {
+		code = "invalid_json"
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": code, "details": ferrs})
 }
 
 // parseManifest decodes and validates the request body. It returns the
 // validated items, or every field error found — the whole manifest is
 // rejected when any single item is invalid.
 func parseManifest(r io.Reader) ([]stowage.Item, []fieldError) {
+	body, ferrs := readBody(r)
+	if ferrs != nil {
+		return nil, ferrs
+	}
+	var req struct {
+		Items json.RawMessage `json:"items"`
+	}
+	if ferrs := decodeObject(body, &req); ferrs != nil {
+		return nil, ferrs
+	}
+	return parseItems(req.Items)
+}
+
+// candidatePosition is the requested new slot for the target container of a
+// relocation preview.
+type candidatePosition struct {
+	Bay  int
+	Deck string
+}
+
+// parseRelocationPreview decodes and validates the request body of the
+// relocation-preview endpoint. The items are validated exactly as in
+// parseManifest; on top of that the target cargo ID must name an item of the
+// manifest and the candidate position must hold a legal bay and deck. Every
+// error found is reported at once and no partial result is produced.
+func parseRelocationPreview(r io.Reader) (items []stowage.Item, target string, cand candidatePosition, ferrs []fieldError) {
+	body, ferrs := readBody(r)
+	if ferrs != nil {
+		return nil, "", candidatePosition{}, ferrs
+	}
+	var req struct {
+		Items         json.RawMessage `json:"items"`
+		TargetCargoID json.RawMessage `json:"target_cargo_id"`
+		Candidate     json.RawMessage `json:"candidate"`
+	}
+	if ferrs := decodeObject(body, &req); ferrs != nil {
+		return nil, "", candidatePosition{}, ferrs
+	}
+
+	var errs []fieldError
+	items, itemErrs := parseItems(req.Items)
+	errs = append(errs, itemErrs...)
+	target, targetOK := parseTargetCargoID(req.TargetCargoID, &errs)
+	cand, _ = parseCandidate(req.Candidate, &errs)
+
+	// The existence check needs a valid manifest and a parsed target ID;
+	// otherwise the errors collected so far already report the real problem.
+	if targetOK && len(itemErrs) == 0 && !cargoIDExists(items, target) {
+		errs = append(errs, fieldError{
+			Field:   "target_cargo_id",
+			Message: fmt.Sprintf("no item with cargo_id %q in the manifest", target),
+		})
+	}
+	if len(errs) > 0 {
+		return nil, "", candidatePosition{}, errs
+	}
+	return items, target, cand, nil
+}
+
+// cargoIDExists reports whether some item carries the given cargo ID.
+func cargoIDExists(items []stowage.Item, id string) bool {
+	for _, it := range items {
+		if it.CargoID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTargetCargoID validates the cargo ID of the container to move.
+func parseTargetCargoID(raw json.RawMessage, errs *[]fieldError) (string, bool) {
+	const field = "target_cargo_id"
+	if raw == nil {
+		*errs = append(*errs, fieldError{Field: field, Message: "is required"})
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		*errs = append(*errs, fieldError{Field: field, Message: "must be a string"})
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		*errs = append(*errs, fieldError{Field: field, Message: "must not be empty"})
+		return "", false
+	}
+	return s, true
+}
+
+// parseCandidate validates the candidate position as an object whose bay and
+// deck obey exactly the same rules as the corresponding item fields.
+func parseCandidate(raw json.RawMessage, errs *[]fieldError) (candidatePosition, bool) {
+	var cand candidatePosition
+	if raw == nil {
+		*errs = append(*errs, fieldError{Field: "candidate", Message: "is required and must be an object with bay and deck"})
+		return cand, false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		*errs = append(*errs, fieldError{Field: "candidate", Message: "must be an object with bay and deck"})
+		return cand, false
+	}
+	ok := true
+	if bay, bayOK := parseBay(fields, "candidate", errs); bayOK {
+		cand.Bay = bay
+	} else {
+		ok = false
+	}
+	if deck, deckOK := parseDeck(fields, "candidate", errs); deckOK {
+		cand.Deck = deck
+	} else {
+		ok = false
+	}
+	return cand, ok
+}
+
+// readBody reads the request body up to the size cap.
+func readBody(r io.Reader) ([]byte, []fieldError) {
 	body, err := io.ReadAll(io.LimitReader(r, maxBodyBytes+1))
 	if err != nil || len(body) > maxBodyBytes {
 		return nil, []fieldError{{Field: "(body)", Message: "request body is unreadable or exceeds 1 MiB"}}
 	}
+	return body, nil
+}
 
-	var req struct {
-		Items json.RawMessage `json:"items"`
-	}
+// decodeObject decodes the body as a single JSON object into req.
+func decodeObject(body []byte, req any) []fieldError {
 	dec := json.NewDecoder(bytes.NewReader(body))
-	if err := dec.Decode(&req); err != nil {
-		return nil, []fieldError{{Field: "(body)", Message: "body must be a single JSON object: " + err.Error()}}
+	if err := dec.Decode(req); err != nil {
+		return []fieldError{{Field: "(body)", Message: "body must be a single JSON object: " + err.Error()}}
 	}
 	if dec.More() {
-		return nil, []fieldError{{Field: "(body)", Message: "unexpected data after the JSON object"}}
+		return []fieldError{{Field: "(body)", Message: "unexpected data after the JSON object"}}
 	}
-	if req.Items == nil {
+	return nil
+}
+
+// parseItems validates the items array shared by both endpoints. It returns
+// the validated items, or every field error found — the whole manifest is
+// rejected when any single item is invalid.
+func parseItems(raw json.RawMessage) ([]stowage.Item, []fieldError) {
+	if raw == nil {
 		return nil, []fieldError{{Field: "items", Message: "is required and must be a non-empty array"}}
 	}
 
 	var rawItems []map[string]json.RawMessage
-	if err := json.Unmarshal(req.Items, &rawItems); err != nil {
+	if err := json.Unmarshal(raw, &rawItems); err != nil {
 		return nil, []fieldError{{Field: "items", Message: "must be an array of objects"}}
 	}
 	if len(rawItems) == 0 {
