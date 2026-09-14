@@ -672,6 +672,7 @@ func TestRelocationPreviewRejectedWholesale(t *testing.T) {
 		{"candidate_bay_out_of_range", previewBody(good, "GAS", 31, "L"), "candidate.bay"},
 		{"candidate_bay_fractional", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS","candidate":{"bay":7.5,"deck":"L"}}`, "candidate.bay"},
 		{"candidate_deck_invalid", previewBody(good, "GAS", 7, "X"), "candidate.deck"},
+		{"candidate_extra_field", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS","candidate":{"bay":7,"deck":"L","row":3}}`, "candidate.row"},
 		{"candidate_missing", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS"}`, "candidate"},
 		{"candidate_not_object", `{"items":[` + itemsJSON(good...) + `],"target_cargo_id":"GAS","candidate":"bay 7"}`, "candidate"},
 		{"manifest_item_invalid", `{"items":[{"cargo_id":"ACID","hazard_class":"8","bay":5,"deck":"U"},` +
@@ -701,6 +702,35 @@ func TestRelocationPreviewRejectedWholesale(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRelocationPreviewRejectsExtraCandidateFields pins the strict shape of
+// the candidate object: every field other than bay and deck is reported by
+// its own path, in ascending order, alongside any bay/deck validation error.
+func TestRelocationPreviewRejectsExtraCandidateFields(t *testing.T) {
+	base := baseURL(t)
+	items := [][4]string{
+		{"ACID", "8", "5", "U"},
+		{"GAS", "2.1", "7", "U"},
+	}
+	body := `{"items":[` + itemsJSON(items...) + `],"target_cargo_id":"GAS",` +
+		`"candidate":{"bay":31,"deck":"L","zeta":1,"alpha":2}}`
+	status, data := postPreview(t, base, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", status, data)
+	}
+	var v validationFailure
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatalf("response is not JSON: %s", data)
+	}
+	// Unknown fields first (ascending), then the bay range error.
+	want := []string{"candidate.alpha", "candidate.zeta", "candidate.bay"}
+	if got := fields(v); !reflect.DeepEqual(got, want) {
+		t.Fatalf("fields = %v, want %v", got, want)
+	}
+	if strings.Contains(string(data), `"before"`) {
+		t.Fatalf("400 body must not contain a partial adjudication: %s", data)
 	}
 }
 

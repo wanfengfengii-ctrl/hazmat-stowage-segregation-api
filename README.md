@@ -163,7 +163,7 @@ curl -s -X POST http://localhost:8080/api/v1/pre-stowage/validate \
 | 字段 | 要求 |
 |---|---|
 | `target_cargo_id` | 待移动箱子的 `cargo_id`，必须存在于清单中 |
-| `candidate` | 候选位置对象，仅含 `bay`（1–30 整数）与 `deck`（`"U"`/`"L"`），校验规则与清单项一致 |
+| `candidate` | 候选位置对象，仅含 `bay`（1–30 整数）与 `deck`（`"U"`/`"L"`），校验规则与清单项一致；携带任何其他字段一律拒绝 |
 
 服务先裁决原清单（`before`），再把目标箱替换到候选位置复算（`after`），两份裁决
 与 validate 响应同格式；`resolved_conflicts` 与 `introduced_conflicts` 分别给出本次
@@ -192,9 +192,10 @@ curl -s -X POST http://localhost:8080/api/v1/pre-stowage/relocation-preview \
 }
 ```
 
-目标箱不存在（`target_cargo_id`）、候选位置非法（`candidate.bay`/`candidate.deck`）
-或清单本身非法（`items[i].*`）时，与 validate 一样整份拒绝：HTTP 400、准确的字段
-路径、一次返回全部错误，且响应中不含任何部分裁决结果。
+目标箱不存在（`target_cargo_id`）、候选位置非法（`candidate.bay`/`candidate.deck`）、
+候选对象携带多余字段（`candidate.<字段名>`）或清单本身非法（`items[i].*`）时，
+与 validate 一样整份拒绝：HTTP 400、准确的字段路径、一次返回全部错误，且响应中
+不含任何部分裁决结果。
 
 ### `GET /healthz`
 

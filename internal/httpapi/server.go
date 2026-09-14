@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -213,7 +214,8 @@ func parseTargetCargoID(raw json.RawMessage, errs *[]fieldError) (string, bool) 
 }
 
 // parseCandidate validates the candidate position as an object whose bay and
-// deck obey exactly the same rules as the corresponding item fields.
+// deck obey exactly the same rules as the corresponding item fields. Any
+// other field is rejected as unknown.
 func parseCandidate(raw json.RawMessage, errs *[]fieldError) (candidatePosition, bool) {
 	var cand candidatePosition
 	if raw == nil {
@@ -226,6 +228,15 @@ func parseCandidate(raw json.RawMessage, errs *[]fieldError) (candidatePosition,
 		return cand, false
 	}
 	ok := true
+	for _, name := range sortedKeys(fields) {
+		if name != "bay" && name != "deck" {
+			*errs = append(*errs, fieldError{
+				Field:   "candidate." + name,
+				Message: "is not allowed; candidate accepts only bay and deck",
+			})
+			ok = false
+		}
+	}
 	if bay, bayOK := parseBay(fields, "candidate", errs); bayOK {
 		cand.Bay = bay
 	} else {
@@ -237,6 +248,17 @@ func parseCandidate(raw json.RawMessage, errs *[]fieldError) (candidatePosition,
 		ok = false
 	}
 	return cand, ok
+}
+
+// sortedKeys returns the map keys in ascending order so that the reported
+// field errors are deterministic.
+func sortedKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // readBody reads the request body up to the size cap.
