@@ -29,6 +29,7 @@ func NewRouter() *gin.Engine {
 	})
 	r.POST("/api/v1/pre-stowage/validate", validateManifest)
 	r.POST("/api/v1/pre-stowage/relocation-preview", relocationPreview)
+	r.POST("/api/v1/pre-stowage/loading-waves", loadingWaves)
 	return r
 }
 
@@ -54,6 +55,14 @@ type relocationPreviewResponse struct {
 	After               validateResponse   `json:"after"`
 	ResolvedConflicts   []stowage.Conflict `json:"resolved_conflicts"`
 	IntroducedConflicts []stowage.Conflict `json:"introduced_conflicts"`
+}
+
+// loadingWavesResponse is the adjudication result of a well-formed manifest
+// together with its partition into loading waves.
+type loadingWavesResponse struct {
+	validateResponse
+	WaveCount int            `json:"wave_count"`
+	Waves     []stowage.Wave `json:"waves"`
 }
 
 // validateManifest handles POST /api/v1/pre-stowage/validate. Any invalid
@@ -100,6 +109,25 @@ func relocationPreview(c *gin.Context) {
 	})
 }
 
+// loadingWaves handles POST /api/v1/pre-stowage/loading-waves. The manifest
+// is validated exactly as in the validate endpoint — any error rejects the
+// whole request with HTTP 400 and no partial result — then adjudicated and
+// partitioned into loading waves so that no wave holds two conflicting
+// containers.
+func loadingWaves(c *gin.Context) {
+	items, ferrs := parseLoadingWaves(c.Request.Body)
+	if len(ferrs) > 0 {
+		rejectValidation(c, ferrs)
+		return
+	}
+	waves := stowage.LoadingWaves(items)
+	c.JSON(http.StatusOK, loadingWavesResponse{
+		validateResponse: adjudicateManifest(items),
+		WaveCount:        len(waves),
+		Waves:            waves,
+	})
+}
+
 // adjudicateManifest runs the segregation rules over a well-formed manifest
 // and shapes the response body shared by both endpoints.
 func adjudicateManifest(items []stowage.Item) validateResponse {
@@ -135,6 +163,37 @@ func parseManifest(r io.Reader) ([]stowage.Item, []fieldError) {
 		return nil, ferrs
 	}
 	return parseItems(req.Items)
+}
+
+// parseLoadingWaves decodes and validates the request body of the
+// loading-waves endpoint. The body accepts only the items field, validated
+// exactly as in parseManifest; any other top-level field is reported by its
+// name, ahead of the item errors, and the whole manifest is rejected when
+// any error is found.
+func parseLoadingWaves(r io.Reader) ([]stowage.Item, []fieldError) {
+	body, ferrs := readBody(r)
+	if ferrs != nil {
+		return nil, ferrs
+	}
+	var fields map[string]json.RawMessage
+	if ferrs := decodeObject(body, &fields); ferrs != nil {
+		return nil, ferrs
+	}
+	var errs []fieldError
+	for _, name := range sortedKeys(fields) {
+		if name != "items" {
+			errs = append(errs, fieldError{
+				Field:   name,
+				Message: "is not allowed; the request accepts only items",
+			})
+		}
+	}
+	items, itemErrs := parseItems(fields["items"])
+	errs = append(errs, itemErrs...)
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return items, nil
 }
 
 // candidatePosition is the requested new slot for the target container of a

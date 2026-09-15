@@ -73,6 +73,21 @@ type previewResponse struct {
 	IntroducedConflicts []conflict   `json:"introduced_conflicts"`
 }
 
+// wave mirrors one entry of the loading-waves response's waves array.
+type wave struct {
+	Wave     int      `json:"wave"`
+	CargoIDs []string `json:"cargo_ids"`
+}
+
+// wavesResult mirrors the loading-waves 200 response body.
+type wavesResult struct {
+	Release      bool       `json:"release"`
+	CheckedPairs int        `json:"checked_pairs"`
+	Conflicts    []conflict `json:"conflicts"`
+	WaveCount    int        `json:"wave_count"`
+	Waves        []wave     `json:"waves"`
+}
+
 // validationFailure mirrors the 400 response body.
 type validationFailure struct {
 	Error   string `json:"error"`
@@ -86,6 +101,7 @@ type validationFailure struct {
 const (
 	validatePath = "/api/v1/pre-stowage/validate"
 	previewPath  = "/api/v1/pre-stowage/relocation-preview"
+	wavesPath    = "/api/v1/pre-stowage/loading-waves"
 )
 
 // postJSON POSTs a raw JSON body to one endpoint of the API.
@@ -111,6 +127,41 @@ func postManifest(t *testing.T, base, body string) (int, []byte) {
 // postPreview POSTs a raw JSON body to the relocation-preview endpoint.
 func postPreview(t *testing.T, base, body string) (int, []byte) {
 	return postJSON(t, base, previewPath, body)
+}
+
+// postWaves POSTs a raw JSON body to the loading-waves endpoint.
+func postWaves(t *testing.T, base, body string) (int, []byte) {
+	return postJSON(t, base, wavesPath, body)
+}
+
+// loadingWaves posts a manifest to the loading-waves endpoint and decodes
+// the expected 200 response.
+func loadingWaves(t *testing.T, base, body string) wavesResult {
+	t.Helper()
+	status, data := postWaves(t, base, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", status, data)
+	}
+	var out wavesResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decoding response: %v; body: %s", err, data)
+	}
+	return out
+}
+
+// rejectWaves posts a manifest to the loading-waves endpoint and decodes the
+// expected 400 response.
+func rejectWaves(t *testing.T, base, body string) validationFailure {
+	t.Helper()
+	status, data := postWaves(t, base, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", status, data)
+	}
+	var out validationFailure
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decoding response: %v; body: %s", err, data)
+	}
+	return out
 }
 
 // adjudicate posts a manifest and decodes the expected 200 response.
@@ -792,5 +843,210 @@ func TestRelocationPreviewOrderIndependent(t *testing.T) {
 	}
 	if out.After.Release {
 		t.Fatal("after.release = true, want false (DELTA conflicts remain)")
+	}
+}
+
+// waveManifest is the five-container manifest with six conflicts used by the
+// loading-waves tests: DELTA (class 1) conflicts with the other four,
+// ALPHA/CHARLIE violate the oxidizer separation and BRAVO/ECHO share the
+// upper deck. Its deterministic wave partition is pinned by the tests.
+func waveManifest() [][4]string {
+	return [][4]string{
+		{"DELTA", "1", "4", "U"},
+		{"ALPHA", "5.1", "10", "U"},
+		{"CHARLIE", "3", "11", "L"},
+		{"BRAVO", "8", "20", "U"},
+		{"ECHO", "2.1", "22", "U"},
+	}
+}
+
+// TestLoadingWavesMultiConflict posts the six-conflict manifest and pins the
+// exact wave partition produced by the selection and placement criteria: the
+// container with the most distinct occupied adjacent waves is placed first,
+// ties break on total conflict degree then cargo ID, and each container goes
+// to the lowest wave none of its neighbors occupy. It also checks that the
+// adjudication fields equal the validate verdict and that the partition
+// invariants hold (every container exactly once, no internal wave conflict).
+func TestLoadingWavesMultiConflict(t *testing.T) {
+	base := baseURL(t)
+	body := manifest(waveManifest()...)
+	out := loadingWaves(t, base, body)
+
+	// The adjudication fields must equal the validate verdict for the same
+	// manifest.
+	want := adjudicate(t, base, body)
+	if out.Release != want.Release || out.CheckedPairs != want.CheckedPairs ||
+		!reflect.DeepEqual(out.Conflicts, want.Conflicts) {
+		t.Fatalf("adjudication = (release=%v, checked=%d, conflicts=%+v), want the validate verdict %+v",
+			out.Release, out.CheckedPairs, out.Conflicts, want)
+	}
+	if out.Release {
+		t.Fatal("release = true, want false")
+	}
+
+	if out.WaveCount != 3 {
+		t.Fatalf("wave_count = %d, want 3", out.WaveCount)
+	}
+	wantWaves := []wave{
+		{Wave: 1, CargoIDs: []string{"DELTA"}},
+		{Wave: 2, CargoIDs: []string{"ALPHA", "BRAVO"}},
+		{Wave: 3, CargoIDs: []string{"CHARLIE", "ECHO"}},
+	}
+	if !reflect.DeepEqual(out.Waves, wantWaves) {
+		t.Fatalf("waves = %+v, want %+v", out.Waves, wantWaves)
+	}
+
+	// Every container appears exactly once across the waves.
+	seen := map[string]int{}
+	inWave := map[string]int{}
+	for _, w := range out.Waves {
+		for _, id := range w.CargoIDs {
+			seen[id]++
+			inWave[id] = w.Wave
+		}
+	}
+	for _, it := range waveManifest() {
+		if id := it[0]; seen[id] != 1 {
+			t.Fatalf("container %s appears %d times, want exactly 1", id, seen[id])
+		}
+	}
+	// No wave holds a conflicting pair.
+	for _, c := range out.Conflicts {
+		if inWave[c.Pair[0]] == inWave[c.Pair[1]] {
+			t.Fatalf("conflicting pair %v both in wave %d", c.Pair, inWave[c.Pair[0]])
+		}
+	}
+}
+
+// TestLoadingWavesOrderIndependent submits the same manifest in two item
+// orders and requires byte-identical loading-waves responses.
+func TestLoadingWavesOrderIndependent(t *testing.T) {
+	base := baseURL(t)
+	forward := manifest(waveManifest()...)
+	reversedItems := waveManifest()
+	for i, j := 0, len(reversedItems)-1; i < j; i, j = i+1, j-1 {
+		reversedItems[i], reversedItems[j] = reversedItems[j], reversedItems[i]
+	}
+	reversed := manifest(reversedItems...)
+
+	status1, body1 := postWaves(t, base, forward)
+	status2, body2 := postWaves(t, base, reversed)
+	if status1 != http.StatusOK || status2 != http.StatusOK {
+		t.Fatalf("statuses = %d, %d; want 200, 200", status1, status2)
+	}
+	if string(body1) != string(body2) {
+		t.Fatalf("item order changed the waves:\n%s\nvs\n%s", body1, body2)
+	}
+}
+
+// TestLoadingWavesConflictFreeSingleWave posts a manifest without conflicts
+// and expects a single wave holding every container, IDs ascending.
+func TestLoadingWavesConflictFreeSingleWave(t *testing.T) {
+	base := baseURL(t)
+	out := loadingWaves(t, base, manifest(
+		[4]string{"C3", "2.1", "20", "U"},
+		[4]string{"C1", "3", "5", "U"},
+		[4]string{"C2", "4.1", "9", "L"},
+	))
+	if !out.Release {
+		t.Fatalf("release = false, want true; conflicts: %+v", out.Conflicts)
+	}
+	if out.WaveCount != 1 {
+		t.Fatalf("wave_count = %d, want 1", out.WaveCount)
+	}
+	want := []wave{{Wave: 1, CargoIDs: []string{"C1", "C2", "C3"}}}
+	if !reflect.DeepEqual(out.Waves, want) {
+		t.Fatalf("waves = %+v, want %+v", out.Waves, want)
+	}
+}
+
+// TestLoadingWavesRejectedWholesale feeds the endpoint invalid manifests and
+// unknown top-level fields: every case must fail with HTTP 400, an accurate
+// field path and no partial wave plan in the body.
+func TestLoadingWavesRejectedWholesale(t *testing.T) {
+	base := baseURL(t)
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"missing_items", `{}`, "items"},
+		{"empty_items", `{"items":[]}`, "items"},
+		{"null_items", `{"items":null}`, "items"},
+		{"bad_bay", manifest([4]string{"A", "3", "99", "U"}), "items[0].bay"},
+		{"bad_class", manifest([4]string{"A", "7", "5", "U"}), "items[0].hazard_class"},
+		{"bad_deck", manifest([4]string{"A", "3", "5", "X"}), "items[0].deck"},
+		{"empty_cargo_id", manifest([4]string{"", "3", "5", "U"}), "items[0].cargo_id"},
+		{"duplicate_cargo_id", manifest(
+			[4]string{"A", "3", "5", "U"},
+			[4]string{"A", "8", "9", "L"},
+		), "items[1].cargo_id"},
+		{"unknown_top_field", `{"items":[` + itemsJSON([4]string{"A", "3", "5", "U"}) + `],"note":"x"}`, "note"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, data := postWaves(t, base, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", status, data)
+			}
+			var v validationFailure
+			if err := json.Unmarshal(data, &v); err != nil {
+				t.Fatalf("response is not JSON: %s", data)
+			}
+			if v.Error != "validation_failed" {
+				t.Fatalf("error = %q, want validation_failed", v.Error)
+			}
+			if !contains(fields(v), tc.field) {
+				t.Fatalf("details = %+v, want field %s", v.Details, tc.field)
+			}
+			// A rejected request must not carry any wave plan.
+			for _, key := range []string{`"wave_count"`, `"waves"`} {
+				if strings.Contains(string(data), key) {
+					t.Fatalf("400 body must not contain %s: %s", key, data)
+				}
+			}
+		})
+	}
+}
+
+// TestLoadingWavesUnknownFieldsOrdering posts several unknown top-level
+// fields together with an invalid item and checks that the unknown fields are
+// reported first, in ascending order, ahead of the item errors, and that no
+// partial wave plan is produced.
+func TestLoadingWavesUnknownFieldsOrdering(t *testing.T) {
+	base := baseURL(t)
+	body := `{"zeta":1,"items":[{"cargo_id":"A","hazard_class":"3","bay":99,"deck":"U"}],"alpha":2}`
+	status, data := postWaves(t, base, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", status, data)
+	}
+	var v validationFailure
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatalf("response is not JSON: %s", data)
+	}
+	// Unknown top-level fields first (ascending), then the item bay error.
+	want := []string{"alpha", "zeta", "items[0].bay"}
+	if got := fields(v); !reflect.DeepEqual(got, want) {
+		t.Fatalf("fields = %v, want %v", got, want)
+	}
+	if strings.Contains(string(data), `"waves"`) {
+		t.Fatalf("400 body must not contain a partial wave plan: %s", data)
+	}
+}
+
+// TestLoadingWavesMalformedJSON posts a truncated body to the loading-waves
+// endpoint and expects the same invalid_json shape as the other endpoints.
+func TestLoadingWavesMalformedJSON(t *testing.T) {
+	base := baseURL(t)
+	status, data := postWaves(t, base, `{"items":`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", status)
+	}
+	var v validationFailure
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatalf("response is not JSON: %s", data)
+	}
+	if v.Error != "invalid_json" {
+		t.Fatalf("error = %q, want invalid_json", v.Error)
 	}
 }

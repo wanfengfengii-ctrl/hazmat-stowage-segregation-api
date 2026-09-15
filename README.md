@@ -1,8 +1,9 @@
 # 码头危险品预配载裁决 API
 
 纯后端 HTTP 服务（Go 1.25 + Gin）：一次提交整份预配载清单，服务先逐字段校验，
-再对**每个无序箱对**执行危险品隔离规则裁决，给出整票放行（`release`）或拦截结论。
-服务无状态，所有结果均由当次请求实时计算，不存在假接口或固定响应。
+再对**每个无序箱对**执行危险品隔离规则裁决，给出整票放行（`release`）或拦截结论；
+被拦截的清单还可预演单箱移位（relocation-preview）或拆分为可执行的装载波次
+（loading-waves）。服务无状态，所有结果均由当次请求实时计算，不存在假接口或固定响应。
 
 ## 裁决规则
 
@@ -197,6 +198,63 @@ curl -s -X POST http://localhost:8080/api/v1/pre-stowage/relocation-preview \
 与 validate 一样整份拒绝：HTTP 400、准确的字段路径、一次返回全部错误，且响应中
 不含任何部分裁决结果。
 
+### `POST /api/v1/pre-stowage/loading-waves`
+
+码头把同票内互相冲突的危险品箱拆成可执行的装载波次。请求体**仅含** `items`
+（字段与校验规则和 validate 完全一致）；携带任何其他顶层字段一律整份拒绝
+（HTTP 400，未知字段按字段名字典序排在清单错误之前）。
+
+服务先按同一套规则完成裁决，再以**首个命中规则**构造无向冲突图，按下列判据
+贪心着色分波：
+
+1. 反复选择「相邻已占波次种类最多」的未分配箱；
+2. 同值时按**总冲突度降序**、再按 `cargo_id` **升序**决胜；
+3. 放入相邻箱**未占用的最小波次**（波次从 1 开始编号）。
+
+保证：每个箱恰好出现一次，任一波次内部不得冲突；波次按编号、箱号按字典序输出；
+无冲突清单合并为一个波次；输入换序得到逐字节相同的响应。
+
+响应在 validate 的裁决字段（`release`、`checked_pairs`、`conflicts`）之外增加：
+
+- `wave_count`：波次总数。
+- `waves`：波次列表，每项含 `wave`（波次编号，从 1 开始）与 `cargo_ids`（该波次箱号，升序）。
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/pre-stowage/loading-waves \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[
+        {"cargo_id":"DELTA","hazard_class":"1","bay":4,"deck":"U"},
+        {"cargo_id":"ALPHA","hazard_class":"5.1","bay":10,"deck":"U"},
+        {"cargo_id":"CHARLIE","hazard_class":"3","bay":11,"deck":"L"},
+        {"cargo_id":"BRAVO","hazard_class":"8","bay":20,"deck":"U"},
+        {"cargo_id":"ECHO","hazard_class":"2.1","bay":22,"deck":"U"}]}'
+```
+
+```json
+{
+  "release": false,
+  "checked_pairs": 10,
+  "conflicts": [
+    {"pair":["ALPHA","CHARLIE"],"rule":"OXIDIZER_BAY_SEPARATION","reason":"hazard class 5.1 and class 3 require bay separation >= 2 (ALPHA bay 10, CHARLIE bay 11)"},
+    {"pair":["ALPHA","DELTA"],"rule":"CLASS_1_ISOLATION","reason":"hazard class 1 conflicts with any other hazard class"},
+    {"pair":["BRAVO","DELTA"],"rule":"CLASS_1_ISOLATION","reason":"hazard class 1 conflicts with any other hazard class"},
+    {"pair":["BRAVO","ECHO"],"rule":"CORROSIVE_FLAMMABLE_GAS_SEPARATION","reason":"hazard class 8 and class 2.1 require different decks and bay separation >= 1 (BRAVO deck U bay 20, ECHO deck U bay 22)"},
+    {"pair":["CHARLIE","DELTA"],"rule":"CLASS_1_ISOLATION","reason":"hazard class 1 conflicts with any other hazard class"},
+    {"pair":["DELTA","ECHO"],"rule":"CLASS_1_ISOLATION","reason":"hazard class 1 conflicts with any other hazard class"}
+  ],
+  "wave_count": 3,
+  "waves": [
+    {"wave":1,"cargo_ids":["DELTA"]},
+    {"wave":2,"cargo_ids":["ALPHA","BRAVO"]},
+    {"wave":3,"cargo_ids":["CHARLIE","ECHO"]}
+  ]
+}
+```
+
+清单缺失、空数组、重复箱号、非法类别或位置、未知顶层字段时，与 validate 一样
+整份拒绝：HTTP 400、一次返回全部错误（未知顶层字段按字段名字典序排在最前，随后
+按清单位置及 `cargo_id`→`deck` 的业务顺序），且响应中不含任何部分波次结果。
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status":"ok"}`（Compose 健康检查与 verify 等待均使用它）。
@@ -213,7 +271,7 @@ curl -s -X POST http://localhost:8080/api/v1/pre-stowage/relocation-preview \
 
 ```
 cmd/api/main.go              进程入口：配置、启动、优雅退出
-internal/stowage/            裁决领域逻辑（箱对规则、确定性排序）及单元测试
+internal/stowage/            裁决领域逻辑（箱对规则、确定性排序、装载波次划分）及单元测试
 internal/httpapi/            Gin 路由、逐字段校验（字段路径错误）及接口测试
 Dockerfile                   多阶段：build / runtime(API) / verify(验收)
 docker-compose.yml           仅常驻 API；verify 为一次性验收服务（profile）
@@ -222,8 +280,11 @@ docker-compose.yml           仅常驻 API；verify 为一次性验收服务（p
 ## 测试
 
 - `internal/stowage`：6×6 类别组合矩阵、bay 差边界（0/1/2）、deck×bay 四象限、
-  1 类对所有类别、排序确定性与箱对数公式、移位前后冲突差集（resolved/introduced）。
+  1 类对所有类别、排序确定性与箱对数公式、移位前后冲突差集（resolved/introduced）；
+  装载波次的确定性划分、换序不变、无冲突单波次及「每箱一次、波次内无冲突」不变量。
 - `internal/httpapi`：标准库 `net/http` 直接请求接口——放行/拦截、边界箱位、
   输入换序响应逐字节一致、整份拒绝、字段路径、重复箱号、非法 JSON 等；
   移位预演覆盖消除冲突、引入冲突、无效目标/位置整份拒绝、清单换序结果不变，
-  并交叉核对预演的 before/after 与 validate 裁决一致。
+  并交叉核对预演的 before/after 与 validate 裁决一致；装载波次覆盖多冲突清单的
+  选点与分波判据、换序逐字节一致、无冲突单波次、非法清单与未知顶层字段整份拒绝，
+  并交叉核对波次接口的裁决字段与 validate 一致。
